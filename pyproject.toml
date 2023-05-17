@@ -10,8 +10,11 @@ python = "^3.9"
 requests = {extras = ["socks"], version = "^2.27.1"}
 fake-useragent = "^0.1.11"
 
-[tool.poetry.dev-dependencies]
-black = "^22.1.0"
+[tool.poetry.group.dev.dependencies]
+black = "^23.3.0"
+flake8 = "^6.0.0"
+bandit = "^1.7.5"
+pydocstyle = "^6.3.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

